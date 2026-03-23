@@ -82,12 +82,36 @@ FORMAT YOUR RESPONSE LIKE THIS (use Slack markdown — *bold*, _italic_, `code`)
 *📋 Team Summary*
 Top 3 takeaways, key open questions, and concrete next steps.
 
+---
+
+*📅 Gantt Chart*
+After the Team Summary, always produce a simple Gantt chart showing the project timeline.
+Use a code block so it renders in monospace in Slack. Format it like this example:
+
+```
+Task                        Wk1  Wk2  Wk3  Wk4
+─────────────────────────── ──── ──── ──── ────
+Planning & Requirements     ████ ░░░░ ░░░░ ░░░░
+Architecture & Design       ░░░░ ████ ░░░░ ░░░░
+Development                 ░░░░ ░░██ ████ ░░░░
+Testing & QA                ░░░░ ░░░░ ░░██ ██░░
+Deployment & Docs           ░░░░ ░░░░ ░░░░ ████
+```
+
+Rules for the Gantt:
+- Derive the tasks and timeline from the PM's plan — make it specific to THIS project.
+- Use ████ for active work, ░░░░ for idle, and label each row with the actual task name.
+- Always show weeks (Wk1, Wk2, etc.) relative to project start.
+- If the project spans more or fewer than 4 weeks, adjust the columns accordingly.
+- Keep task names concise (max 28 chars) so the chart stays aligned.
+- For a "quick take" request, skip the Gantt.
+
 IMPORTANT RULES:
 - If the brief is vague, the PM should flag this and ask clarifying questions,
   but still attempt an analysis with stated assumptions.
-- If the user asks for a "quick take", compress each agent to 2-4 sentences.
+- If the user asks for a "quick take", compress each agent to 2-4 sentences and skip the Gantt.
 - Keep each agent's voice distinct. The Critic should raise points the others missed.
-- Always end with the Team Summary.
+- Always end with the Team Summary followed by the Gantt Chart.
 - Format for Slack: use *bold* for headers, avoid markdown # headers, keep lines readable.
 """.strip()
 
