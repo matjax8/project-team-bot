@@ -1,0 +1,28 @@
+display_information:
+  name: Project Team
+  description: A virtual 4-agent project team — PM, Researcher, Report Creator & Critic.
+  background_color: "#2c2d30"
+
+features:
+  bot_user:
+    display_name: Project Team
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      - chat:write          # Post messages
+      - channels:history    # Read messages in public channels
+      - channels:read       # Look up channel info by ID
+      - app_mentions:read   # Respond when @mentioned
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels    # All messages in channels the bot has joined
+      - app_mention         # When someone @mentions the bot
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true  # No public URL needed
+  token_rotation_enabled: false

@@ -1,0 +1,221 @@
+"""
+Project Team Bot — Slack bot powered by Claude
+================================================
+When someone posts a brief in #project-briefs, this bot runs it through
+a virtual 4-agent project team (PM, Researcher, Report Creator, Critic)
+and replies in the thread with the full analysis.
+
+Requires:
+  SLACK_BOT_TOKEN    — xoxb-... token from your Slack app
+  SLACK_APP_TOKEN    — xapp-... token (for Socket Mode)
+  ANTHROPIC_API_KEY  — from console.anthropic.com
+"""
+
+import os
+import re
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+from anthropic import Anthropic
+
+# ── Clients ──────────────────────────────────────────────────────────────────
+
+slack_app = App(token=os.environ["SLACK_BOT_TOKEN"])
+claude    = Anthropic()  # reads ANTHROPIC_API_KEY from environment
+
+# ── Project Team System Prompt ───────────────────────────────────────────────
+
+SYSTEM_PROMPT = """
+You are orchestrating a virtual project team of 4 AI agents for software and tech projects.
+Each agent has a distinct role, personality, and focus area. They work sequentially,
+each building on the previous agent's output.
+
+THE TEAM:
+
+1. Project Manager (PM)
+   Focus: Structure, planning, priorities, risks, timelines.
+   Read the brief and produce: core objective, key deliverables, risks/blockers,
+   priority order, and open questions before work begins.
+   Voice: Direct, organised, action-oriented.
+
+2. Researcher / Analyst
+   Focus: Deep technical investigation, trade-off analysis, context.
+   Build on the PM's plan: investigate feasibility, compare approaches,
+   surface relevant patterns and prior art, flag unknowns.
+   Voice: Thoughtful, thorough, evidence-based.
+
+3. Report Creator
+   Focus: Synthesis, clear communication.
+   Synthesise the PM and Researcher into a clean narrative with executive summary,
+   key findings, and recommendations. Write for a mixed technical/leadership audience.
+   Voice: Clear, professional, readable.
+
+4. Critic / Reviewer
+   Focus: Quality assurance, devil's advocate.
+   Push back on the team's output: what's missing from the plan, gaps in the analysis,
+   assumptions that might be wrong, risks nobody mentioned.
+   Voice: Constructive but direct. Specific about what needs fixing and why.
+
+FORMAT YOUR RESPONSE LIKE THIS (use Slack markdown — *bold*, _italic_, `code`):
+
+*🗂 Project Manager*
+[PM analysis here]
+
+---
+
+*🔍 Researcher / Analyst*
+[Research analysis here]
+
+---
+
+*✍️ Report Creator*
+[Report summary here]
+
+---
+
+*🔎 Critic / Reviewer*
+[Critique here]
+
+---
+
+*📋 Team Summary*
+Top 3 takeaways, key open questions, and concrete next steps.
+
+IMPORTANT RULES:
+- If the brief is vague, the PM should flag this and ask clarifying questions,
+  but still attempt an analysis with stated assumptions.
+- If the user asks for a "quick take", compress each agent to 2-4 sentences.
+- Keep each agent's voice distinct. The Critic should raise points the others missed.
+- Always end with the Team Summary.
+- Format for Slack: use *bold* for headers, avoid markdown # headers, keep lines readable.
+""".strip()
+
+# ── Bot User ID (to avoid responding to ourselves) ────────────────────────────
+
+BOT_USER_ID = None
+
+@slack_app.event("app_home_opened")
+def handle_app_home_opened(event, logger):
+    pass  # required to avoid unhandled event warnings
+
+def get_bot_user_id():
+    global BOT_USER_ID
+    if BOT_USER_ID is None:
+        result = slack_app.client.auth_test()
+        BOT_USER_ID = result["user_id"]
+    return BOT_USER_ID
+
+# ── Core handler ─────────────────────────────────────────────────────────────
+
+@slack_app.message()
+def handle_message(message, say, logger):
+    """
+    Fires on every message in channels the bot has joined.
+    We filter to #project-briefs and ignore bot messages / thread replies.
+    """
+
+    # Skip messages from bots (including ourselves)
+    if message.get("bot_id") or message.get("subtype"):
+        return
+
+    # Skip if this is already a thread reply (thread_ts != ts means it's a reply)
+    if message.get("thread_ts") and message["thread_ts"] != message["ts"]:
+        return
+
+    # Only respond in #project-briefs
+    channel_name = get_channel_name(message["channel"])
+    if channel_name != "project-briefs":
+        return
+
+    brief = message.get("text", "").strip()
+    if not brief:
+        return
+
+    # Strip any @mentions from the text (in case someone @-mentions the bot)
+    brief = re.sub(r"<@[A-Z0-9]+>", "", brief).strip()
+
+    thread_ts = message["ts"]
+
+    logger.info(f"Running project team on brief: {brief[:80]}...")
+
+    # Post a "thinking" message in the thread so the user knows something is happening
+    thinking_response = slack_app.client.chat_postMessage(
+        channel=message["channel"],
+        thread_ts=thread_ts,
+        text="🤔 *Project Team is reviewing this brief...* (this takes ~20 seconds)",
+    )
+
+    # Call Claude
+    try:
+        response = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": f"Project brief:\n\n{brief}"}
+            ],
+        )
+        analysis = response.content[0].text
+    except Exception as e:
+        logger.error(f"Claude API error: {e}")
+        slack_app.client.chat_update(
+            channel=message["channel"],
+            ts=thinking_response["ts"],
+            text=f"❌ Sorry, the team ran into an error: `{str(e)}`",
+        )
+        return
+
+    # Update the thinking message with the real analysis
+    # Slack messages are capped at 4000 chars per block, so split if needed
+    if len(analysis) <= 3900:
+        slack_app.client.chat_update(
+            channel=message["channel"],
+            ts=thinking_response["ts"],
+            text=analysis,
+        )
+    else:
+        # Delete the thinking message and post in chunks
+        slack_app.client.chat_delete(
+            channel=message["channel"],
+            ts=thinking_response["ts"],
+        )
+        chunks = split_into_chunks(analysis, 3900)
+        for i, chunk in enumerate(chunks):
+            prefix = "*🤖 Virtual Project Team Analysis*\n\n" if i == 0 else ""
+            slack_app.client.chat_postMessage(
+                channel=message["channel"],
+                thread_ts=thread_ts,
+                text=prefix + chunk,
+            )
+
+    logger.info("Analysis posted successfully.")
+
+
+def get_channel_name(channel_id: str) -> str:
+    """Look up the channel name from its ID."""
+    try:
+        result = slack_app.client.conversations_info(channel=channel_id)
+        return result["channel"]["name"]
+    except Exception:
+        return ""
+
+
+def split_into_chunks(text: str, max_len: int) -> list[str]:
+    """Split text at the nearest paragraph break before max_len."""
+    chunks = []
+    while len(text) > max_len:
+        split_at = text.rfind("\n\n", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(text[:split_at].strip())
+        text = text[split_at:].strip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("🚀 Project Team Bot starting (Socket Mode)...")
+    handler = SocketModeHandler(slack_app, os.environ["SLACK_APP_TOKEN"])
+    handler.start()
