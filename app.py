@@ -13,6 +13,8 @@ Requires:
 
 import os
 import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from anthropic import Anthropic
@@ -106,40 +108,40 @@ def get_bot_user_id():
 
 # ── Core handler ─────────────────────────────────────────────────────────────
 
-@slack_app.message()
-def handle_message(message, say, logger):
-    """
-    Fires on every message in channels the bot has joined.
-    We filter to #project-briefs and ignore bot messages / thread replies.
-    """
+@slack_app.event("app_mention")
+def handle_mention(event, say, logger):
+    """Fires when someone @mentions the bot in any channel."""
+    # Reuse the same logic as handle_message
+    handle_brief(event, say, logger)
+
+def handle_brief(event, say, logger):
+    """Core logic — handles a project brief from either a message or @mention."""
 
     # Skip messages from bots (including ourselves)
-    if message.get("bot_id") or message.get("subtype"):
+    if event.get("bot_id") or event.get("subtype"):
         return
 
-    # Skip if this is already a thread reply (thread_ts != ts means it's a reply)
-    if message.get("thread_ts") and message["thread_ts"] != message["ts"]:
+    # Skip if this is already a thread reply
+    if event.get("thread_ts") and event["thread_ts"] != event["ts"]:
         return
 
-    # Only respond in #project-briefs
-    channel_name = get_channel_name(message["channel"])
-    if channel_name != "project-briefs":
-        return
-
-    brief = message.get("text", "").strip()
+    brief = event.get("text", "").strip()
     if not brief:
         return
 
-    # Strip any @mentions from the text (in case someone @-mentions the bot)
+    # Strip any @mentions from the text
     brief = re.sub(r"<@[A-Z0-9]+>", "", brief).strip()
+    if not brief:
+        return
 
-    thread_ts = message["ts"]
+    channel = event["channel"]
+    thread_ts = event["ts"]
 
     logger.info(f"Running project team on brief: {brief[:80]}...")
 
-    # Post a "thinking" message in the thread so the user knows something is happening
+    # Post a "thinking" message in the thread
     thinking_response = slack_app.client.chat_postMessage(
-        channel=message["channel"],
+        channel=channel,
         thread_ts=thread_ts,
         text="🤔 *Project Team is reviewing this brief...* (this takes ~20 seconds)",
     )
@@ -158,36 +160,43 @@ def handle_message(message, say, logger):
     except Exception as e:
         logger.error(f"Claude API error: {e}")
         slack_app.client.chat_update(
-            channel=message["channel"],
+            channel=channel,
             ts=thinking_response["ts"],
             text=f"❌ Sorry, the team ran into an error: `{str(e)}`",
         )
         return
 
     # Update the thinking message with the real analysis
-    # Slack messages are capped at 4000 chars per block, so split if needed
     if len(analysis) <= 3900:
         slack_app.client.chat_update(
-            channel=message["channel"],
+            channel=channel,
             ts=thinking_response["ts"],
             text=analysis,
         )
     else:
-        # Delete the thinking message and post in chunks
         slack_app.client.chat_delete(
-            channel=message["channel"],
+            channel=channel,
             ts=thinking_response["ts"],
         )
         chunks = split_into_chunks(analysis, 3900)
         for i, chunk in enumerate(chunks):
             prefix = "*🤖 Virtual Project Team Analysis*\n\n" if i == 0 else ""
             slack_app.client.chat_postMessage(
-                channel=message["channel"],
+                channel=channel,
                 thread_ts=thread_ts,
                 text=prefix + chunk,
             )
 
     logger.info("Analysis posted successfully.")
+
+
+@slack_app.message()
+def handle_message(message, say, logger):
+    """Fires on regular messages — only responds in #project-briefs."""
+    channel_name = get_channel_name(message["channel"])
+    if channel_name != "project-briefs":
+        return
+    handle_brief(message, say, logger)
 
 
 def get_channel_name(channel_id: str) -> str:
@@ -215,7 +224,21 @@ def split_into_chunks(text: str, max_len: int) -> list[str]:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def start_health_server():
+    """Tiny web server so Render's Web Service health check passes."""
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Project Team Bot is running.")
+        def log_message(self, format, *args):
+            pass  # silence access logs
+    port = int(os.environ.get("PORT", 8080))
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
 if __name__ == "__main__":
     print("🚀 Project Team Bot starting (Socket Mode)...")
+    # Start health check server in background so Render stays happy
+    threading.Thread(target=start_health_server, daemon=True).start()
     handler = SocketModeHandler(slack_app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
