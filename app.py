@@ -1,230 +1,90 @@
+#!/usr/bin/env python3
 """
-Project Team Bot — Slack bot powered by Claude
-================================================
-When someone posts a brief in #project-briefs, this bot runs it through
-a virtual 4-agent project team (PM, Researcher, Report Creator, Critic)
-and replies in the thread with the full analysis.
-
-Requires:
-  SLACK_BOT_TOKEN    — xoxb-... token from your Slack app
-  SLACK_APP_TOKEN    — xapp-... token (for Socket Mode)
-  ANTHROPIC_API_KEY  — from console.anthropic.com
+Slackbot — AI Project Team
+Fast PM scope on @mention, full 4-agent analysis on #detail reply.
 """
 
+import logging
 import os
 import re
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from anthropic import Anthropic
 
-# ── Clients ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
 
 slack_app = App(token=os.environ["SLACK_BOT_TOKEN"])
-claude    = Anthropic()  # reads ANTHROPIC_API_KEY from environment
+claude = Anthropic()
 
-# ── Project Team System Prompt ───────────────────────────────────────────────
+# In-memory store: thread_ts -> {channel, brief, pm_output}
+# Holds context for threads waiting for a #detail reply
+active_threads: dict = {}
 
-SYSTEM_PROMPT = """
-You are orchestrating a virtual project team of 4 AI agents for software and tech projects.
-Each agent has a distinct role, personality, and focus area. They work sequentially,
-each building on the previous agent's output.
 
-THE TEAM:
+# ── Prompts ───────────────────────────────────────────────────────────────────
 
-1. Project Manager (PM)
-   Focus: Structure, planning, priorities, risks, timelines.
-   Read the brief and produce: core objective, key deliverables, risks/blockers,
-   priority order, and open questions before work begins.
-   Voice: Direct, organised, action-oriented.
+PM_PROMPT = """\
+You are a Project Manager doing a rapid brief scope. Be fast and decisive.
 
-2. Researcher / Analyst
-   Focus: Deep technical investigation, trade-off analysis, context.
-   Build on the PM's plan: investigate feasibility, compare approaches,
-   surface relevant patterns and prior art, flag unknowns.
-   Voice: Thoughtful, thorough, evidence-based.
+Structure your response exactly like this (Slack markdown — *bold*, `code`):
 
-3. Report Creator
-   Focus: Synthesis, clear communication.
-   Synthesise the PM and Researcher into a clean narrative with executive summary,
-   key findings, and recommendations. Write for a mixed technical/leadership audience.
-   Voice: Clear, professional, readable.
+*🎯 Objective*
+One clear sentence — what are we building or solving?
 
-4. Critic / Reviewer
-   Focus: Quality assurance, devil's advocate.
-   Push back on the team's output: what's missing from the plan, gaps in the analysis,
-   assumptions that might be wrong, risks nobody mentioned.
-   Voice: Constructive but direct. Specific about what needs fixing and why.
+*📦 Key Deliverables*
+3–5 specific outputs, one line each
 
-FORMAT YOUR RESPONSE LIKE THIS (use Slack markdown — *bold*, _italic_, `code`):
+*⚠️ Risks & Blockers*
+Top 3 risks, one line each
 
-*🗂 Project Manager*
-[PM analysis here]
+*❓ Open Questions*
+What's missing before work can start? 3–5 bullets
 
----
+*📊 Priority*
+High / Medium / Low — one line reason
 
-*🔍 Researcher / Analyst*
-[Research analysis here]
+Keep it under 350 words. No waffle. No preamble.\
+"""
+
+DETAIL_PROMPT = """\
+You are a virtual project team continuing analysis from a PM scope.
+Run three agents sequentially, each building on the previous.
+
+Original brief:
+{brief}
+
+PM Scope already completed:
+{pm_output}
 
 ---
 
-*✍️ Report Creator*
-[Report summary here]
+Now run the following three agents:
 
----
+*🔍 Researcher & Analyst*
+Deep technical investigation — feasibility, approaches, trade-offs, unknowns, prior art.
+Thorough and evidence-based.
 
-*🔎 Critic / Reviewer*
-[Critique here]
+*📝 Report Creator*
+Synthesise the PM scope and Research into a clean narrative.
+Include: executive summary, key findings, recommendations.
+Write for a mixed technical and leadership audience.
 
----
-
-*📋 Team Summary*
-Top 3 takeaways, key open questions, and concrete next steps.
-
----
-
-*📅 Gantt Chart*
-After the Team Summary, always produce a simple Gantt chart showing the project timeline.
-Use a code block so it renders in monospace in Slack. Format it like this example:
-
-```
-Task                        Wk1  Wk2  Wk3  Wk4
-─────────────────────────── ──── ──── ──── ────
-Planning & Requirements     ████ ░░░░ ░░░░ ░░░░
-Architecture & Design       ░░░░ ████ ░░░░ ░░░░
-Development                 ░░░░ ░░██ ████ ░░░░
-Testing & QA                ░░░░ ░░░░ ░░██ ██░░
-Deployment & Docs           ░░░░ ░░░░ ░░░░ ████
-```
-
-Rules for the Gantt:
-- Derive the tasks and timeline from the PM's plan — make it specific to THIS project.
-- Use ████ for active work, ░░░░ for idle, and label each row with the actual task name.
-- Always show weeks (Wk1, Wk2, etc.) relative to project start.
-- If the project spans more or fewer than 4 weeks, adjust the columns accordingly.
-- Keep task names concise (max 28 chars) so the chart stays aligned.
-- For a "quick take" request, skip the Gantt.
-
-IMPORTANT RULES:
-- If the brief is vague, the PM should flag this and ask clarifying questions,
-  but still attempt an analysis with stated assumptions.
-- If the user asks for a "quick take", compress each agent to 2-4 sentences and skip the Gantt.
-- Keep each agent's voice distinct. The Critic should raise points the others missed.
-- Always end with the Team Summary followed by the Gantt Chart.
-- Format for Slack: use *bold* for headers, avoid markdown # headers, keep lines readable.
-""".strip()
-
-# ── Bot User ID (to avoid responding to ourselves) ────────────────────────────
-
-BOT_USER_ID = None
-
-@slack_app.event("app_home_opened")
-def handle_app_home_opened(event, logger):
-    pass  # required to avoid unhandled event warnings
-
-def get_bot_user_id():
-    global BOT_USER_ID
-    if BOT_USER_ID is None:
-        result = slack_app.client.auth_test()
-        BOT_USER_ID = result["user_id"]
-    return BOT_USER_ID
-
-# ── Core handler ─────────────────────────────────────────────────────────────
-
-@slack_app.event("app_mention")
-def handle_mention(event, say, logger):
-    """Fires when someone @mentions the bot in any channel."""
-    # Reuse the same logic as handle_message
-    handle_brief(event, say, logger)
-
-def handle_brief(event, say, logger):
-    """Core logic — handles a project brief from either a message or @mention."""
-
-    # Skip messages from bots (including ourselves)
-    if event.get("bot_id") or event.get("subtype"):
-        return
-
-    # Skip if this is already a thread reply
-    if event.get("thread_ts") and event["thread_ts"] != event["ts"]:
-        return
-
-    brief = event.get("text", "").strip()
-    if not brief:
-        return
-
-    # Strip any @mentions from the text
-    brief = re.sub(r"<@[A-Z0-9]+>", "", brief).strip()
-    if not brief:
-        return
-
-    channel = event["channel"]
-    thread_ts = event["ts"]
-
-    logger.info(f"Running project team on brief: {brief[:80]}...")
-
-    # Post a "thinking" message in the thread
-    thinking_response = slack_app.client.chat_postMessage(
-        channel=channel,
-        thread_ts=thread_ts,
-        text="🤔 *Project Team is reviewing this brief...* (this takes ~20 seconds)",
-    )
-
-    # Call Claude
-    try:
-        response = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": f"Project brief:\n\n{brief}"}
-            ],
-        )
-        analysis = response.content[0].text
-    except Exception as e:
-        logger.error(f"Claude API error: {e}")
-        slack_app.client.chat_update(
-            channel=channel,
-            ts=thinking_response["ts"],
-            text=f"❌ Sorry, the team ran into an error: `{str(e)}`",
-        )
-        return
-
-    # Update the thinking message with the real analysis
-    if len(analysis) <= 3900:
-        slack_app.client.chat_update(
-            channel=channel,
-            ts=thinking_response["ts"],
-            text=analysis,
-        )
-    else:
-        slack_app.client.chat_delete(
-            channel=channel,
-            ts=thinking_response["ts"],
-        )
-        chunks = split_into_chunks(analysis, 3900)
-        for i, chunk in enumerate(chunks):
-            prefix = "*🤖 Virtual Project Team Analysis*\n\n" if i == 0 else ""
-            slack_app.client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=prefix + chunk,
-            )
-
-    logger.info("Analysis posted successfully.")
+*🎯 Critic & Reviewer*
+Push back on the team's work. What's missing? What assumptions are wrong?
+What risks weren't mentioned? What needs fixing before this moves forward?
+Be specific and constructive.\
+"""
 
 
-@slack_app.message()
-def handle_message(message, say, logger):
-    """Fires on regular messages — only responds in #project-briefs."""
-    channel_name = get_channel_name(message["channel"])
-    if channel_name != "project-briefs":
-        return
-    handle_brief(message, say, logger)
-
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_channel_name(channel_id: str) -> str:
-    """Look up the channel name from its ID."""
     try:
         result = slack_app.client.conversations_info(channel=channel_id)
         return result["channel"]["name"]
@@ -232,8 +92,7 @@ def get_channel_name(channel_id: str) -> str:
         return ""
 
 
-def split_into_chunks(text: str, max_len: int) -> list[str]:
-    """Split text at the nearest paragraph break before max_len."""
+def split_chunks(text: str, max_len: int = 3900) -> list[str]:
     chunks = []
     while len(text) > max_len:
         split_at = text.rfind("\n\n", 0, max_len)
@@ -246,23 +105,185 @@ def split_into_chunks(text: str, max_len: int) -> list[str]:
     return chunks
 
 
+def post_or_update(channel: str, ts: str, thread_ts: str, text: str, label: str = ""):
+    """Update an existing message, chunking if needed."""
+    if len(text) <= 3900:
+        slack_app.client.chat_update(channel=channel, ts=ts, text=text)
+    else:
+        try:
+            slack_app.client.chat_delete(channel=channel, ts=ts)
+        except Exception as e:
+            logger.warning(f"Could not delete placeholder: {e}")
+        chunks = split_chunks(text)
+        for i, chunk in enumerate(chunks):
+            prefix = f"*{label}*\n\n" if (i == 0 and label) else ""
+            slack_app.client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=prefix + chunk,
+            )
+
+
+# ── Core handlers ─────────────────────────────────────────────────────────────
+
+def run_pm_scope(event: dict):
+    """Run a quick PM scope and post it, priming the thread for #detail."""
+    brief = re.sub(r"<@[A-Z0-9]+>", "", event.get("text", "")).strip()
+    if not brief:
+        return
+
+    channel = event["channel"]
+    thread_ts = event["ts"]
+
+    logger.info(f"PM scope: {brief[:80]}")
+
+    # Immediate ack
+    try:
+        ack = slack_app.client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text="📋 *Scoping your brief...* (about 30 seconds)",
+        )
+        ack_ts = ack["ts"]
+    except Exception as e:
+        logger.error(f"Failed to post ack: {e}")
+        return
+
+    # PM agent
+    try:
+        resp = claude.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=800,
+            messages=[{"role": "user", "content": f"{PM_PROMPT}\n\nBrief:\n{brief}"}],
+        )
+        pm_output = resp.content[0].text
+        logger.info(f"PM scope done ({len(pm_output)} chars)")
+    except Exception as e:
+        logger.error(f"Claude error: {e}")
+        try:
+            slack_app.client.chat_update(channel=channel, ts=ack_ts, text=f"❌ Error: `{e}`")
+        except Exception:
+            pass
+        return
+
+    # Post PM scope + #detail prompt
+    try:
+        full = (
+            f"{pm_output}\n\n"
+            "---\n"
+            "_Need more detail? Reply `#detail` and I'll run the full team — "
+            "Researcher, Report Creator & Critic (2–4 mins)._"
+        )
+        slack_app.client.chat_update(channel=channel, ts=ack_ts, text=full)
+        active_threads[thread_ts] = {
+            "channel": channel,
+            "brief": brief,
+            "pm_output": pm_output,
+        }
+        logger.info(f"PM scope posted. Thread {thread_ts} ready for #detail")
+    except Exception as e:
+        logger.error(f"Failed to post PM scope: {e}")
+
+
+def run_detail_analysis(event: dict):
+    """Run Researcher + Report Creator + Critic for a thread that requested #detail."""
+    thread_ts = event.get("thread_ts") or event["ts"]
+    ctx = active_threads.get(thread_ts)
+    if not ctx:
+        logger.warning(f"No active thread context for {thread_ts} — ignoring #detail")
+        return
+
+    channel = ctx["channel"]
+    brief = ctx["brief"]
+    pm_output = ctx["pm_output"]
+
+    logger.info(f"Detail analysis for thread {thread_ts}")
+
+    try:
+        ack = slack_app.client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=(
+                "🔍 *Running full team analysis...*\n"
+                "> Researcher → Report Creator → Critic\n"
+                "_Takes 2–4 mins with Claude Opus. Hang tight._"
+            ),
+        )
+        ack_ts = ack["ts"]
+    except Exception as e:
+        logger.error(f"Failed to post detail ack: {e}")
+        return
+
+    try:
+        prompt = DETAIL_PROMPT.format(brief=brief, pm_output=pm_output)
+        resp = claude.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        analysis = resp.content[0].text
+        logger.info(f"Detail done ({len(analysis)} chars)")
+    except Exception as e:
+        logger.error(f"Claude error on detail: {e}")
+        try:
+            slack_app.client.chat_update(channel=channel, ts=ack_ts, text=f"❌ Error: `{e}`")
+        except Exception:
+            pass
+        return
+
+    try:
+        post_or_update(channel, ack_ts, thread_ts, analysis, label="🤖 Full Team Analysis")
+        del active_threads[thread_ts]
+        logger.info("Detail analysis posted successfully")
+    except Exception as e:
+        logger.error(f"Failed to post detail analysis: {e}")
+
+
+# ── Slack event handlers ──────────────────────────────────────────────────────
+
+@slack_app.event("app_home_opened")
+def handle_app_home(event, logger):
+    pass  # suppress unhandled event warning
+
+
+@slack_app.event("app_mention")
+def handle_mention(event, logger):
+    """@mention anywhere — run PM scope (unless it's a #detail reply)."""
+    # Skip bot messages
+    if event.get("bot_id") or event.get("subtype"):
+        return
+    # If it's a thread reply containing #detail, run detail
+    if event.get("thread_ts") and event["thread_ts"] != event["ts"]:
+        if "#detail" in event.get("text", "").lower():
+            run_detail_analysis(event)
+        return
+    run_pm_scope(event)
+
+
+@slack_app.message()
+def handle_message(message, say, logger):
+    """Handle messages — PM scope in #project-briefs, #detail in known threads."""
+    if message.get("bot_id") or message.get("subtype"):
+        return
+
+    text = message.get("text", "").lower()
+    thread_ts = message.get("thread_ts")
+
+    if thread_ts and "#detail" in text:
+        # #detail reply in a thread — check if we have context
+        if thread_ts in active_threads:
+            run_detail_analysis(message)
+        return
+
+    if not thread_ts:
+        # Top-level message — only respond in #project-briefs
+        if get_channel_name(message["channel"]) == "project-briefs":
+            run_pm_scope(message)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def start_health_server():
-    """Tiny web server so Render's Web Service health check passes."""
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Project Team Bot is running.")
-        def log_message(self, format, *args):
-            pass  # silence access logs
-    port = int(os.environ.get("PORT", 8080))
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-
 if __name__ == "__main__":
-    print("🚀 Project Team Bot starting (Socket Mode)...")
-    # Start health check server in background so Render stays happy
-    threading.Thread(target=start_health_server, daemon=True).start()
+    logger.info("Slackbot starting (Socket Mode)...")
     handler = SocketModeHandler(slack_app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
