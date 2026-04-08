@@ -143,6 +143,7 @@ def run_pm_scope(event: dict):
             channel=channel,
             thread_ts=thread_ts,
             text="📋 *Scoping your brief...* (about 30 seconds)",
+            reply_broadcast=True,
         )
         ack_ts = ack["ts"]
     except Exception as e:
@@ -152,7 +153,7 @@ def run_pm_scope(event: dict):
     # PM agent
     try:
         resp = claude.messages.create(
-            model="claude-opus-4-6",
+            model="claude-haiku-4-5-20251001",
             max_tokens=800,
             messages=[{"role": "user", "content": f"{PM_PROMPT}\n\nBrief:\n{brief}"}],
         )
@@ -174,7 +175,16 @@ def run_pm_scope(event: dict):
             "_Need more detail? Reply `#detail` and I'll run the full team — "
             "Researcher, Report Creator & Critic (2–4 mins)._"
         )
-        slack_app.client.chat_update(channel=channel, ts=ack_ts, text=full)
+        try:
+            slack_app.client.chat_delete(channel=channel, ts=ack_ts)
+        except Exception:
+            pass
+        slack_app.client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=full,
+            reply_broadcast=True,
+        )
         active_threads[thread_ts] = {
             "channel": channel,
             "brief": brief,
@@ -277,6 +287,9 @@ def handle_message(message, say, logger):
 
     if not thread_ts:
         # Top-level message — only respond in #project-briefs
+        # Skip @mentions — handle_mention already handles those
+        if re.search(r"<@[A-Z0-9]+>", message.get("text", "")):
+            return
         if get_channel_name(message["channel"]) == "project-briefs":
             run_pm_scope(message)
 

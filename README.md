@@ -42,12 +42,14 @@ Import `slack-app-manifest.yaml` at api.slack.com to configure the app automatic
 
 ## Usage
 
-- Post a project brief in `#project-briefs` → bot replies in-thread with full 4-agent analysis
-- @mention the bot anywhere in the workspace → same analysis
+- Post a project brief in `#project-briefs` → bot replies in the channel with a quick PM scope
+- @mention the bot anywhere in the workspace → same PM scope
+- Reply `#detail` in the thread → full team analysis (Researcher, Report Creator, Critic) — takes 2–4 mins
 
-## Model
+## Models
 
-Uses `claude-opus-4-6`. Change the `model` parameter in `handle_brief()` to switch.
+- **PM scope** (`#project-briefs` / @mention): `claude-haiku-4-5` — fast, ~5 seconds
+- **Full team analysis** (`#detail`): `claude-opus-4-6` — thorough, 2–4 mins
 
 ## Related
 
